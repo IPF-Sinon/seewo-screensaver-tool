@@ -580,45 +580,15 @@
             }
           } catch (e) { log.warn('预广播转场数组失败（官方逻辑仍会广播）: ' + (e.message || e)); }
           var __ret = original.call(this, forwarded);
-          // ★ 随机模式：间隔数量*间隔 + 1 秒后再打乱一次
-          try {
-            var __sh = cfg.override && cfg.override.shuffle === true;
-            if (__sh) {
-              if (state.shuffleTimer) { clearTimeout(state.shuffleTimer); state.shuffleTimer = null; }
-              var __imgs = (forwarded.data && forwarded.data.imageList) || [];
-              var __n = __imgs.length;
-              var __iv = Number((cfg.override && cfg.override.switchInterval) || (forwarded.data && forwarded.data.switchInterval)) || 5;
-              if (__n > 1) {
-                var __delay = __n * __iv + 1;
-                state.shuffleTimer = setTimeout(function () {
-                  try {
-                    // 关键：只有用户仍然空闲（说明屏保还在）才重新打乱。
-                    // 重新打乱的做法是「再发一次 onMessage」，而 onMessage 会让屏保重新显示；
-                    // 若用户早就关了屏保，这一下就会凭空把屏保弹出来。
-                    // 用户实测「没设超时却约 5 分钟后莫名弹屏保，而且我一直在操作」
-                    // —— 20 张 x 15 秒 + 1 = 301 秒，正好对上。
-                    var el2 = getElectronModule();
-                    var pm2 = el2 && el2.powerMonitor;
-                    var idle2 = (pm2 && typeof pm2.getSystemIdleTime === "function")
-                      ? Number(pm2.getSystemIdleTime()) : -1;
-                    if (idle2 >= 0 && idle2 < 10) {
-                      log.info("随机模式：检测到用户正在操作（空闲 " + idle2 + " 秒），取消本次重新打乱");
-                      state.shuffleTimer = null;
-                      return;
-                    }
-                    var p2 = JSON.parse(JSON.stringify(forwarded.data));
-                    if (Array.isArray(p2.imageList)) { shuffleInPlace(p2.imageList); }
-                    if (Array.isArray(p2.transitionList)) { shuffleInPlace(p2.transitionList); }
-                    controller.onMessage({ url: SCREENSAVER_ROUTE, data: p2 });
-                    log.info('随机模式：已按计划重新打乱（' + __n + ' 张，间隔 ' + __iv + 's，等待 ' + __delay + 's）');
-                  } catch (e) { log.warn('随机模式重新打乱失败: ' + (e && e.message || e)); }
-                }, __delay * 1000);
-                log.info('随机模式：' + __delay + ' 秒后会再打乱一次');
-              }
-            } else if (state.shuffleTimer) {
-              clearTimeout(state.shuffleTimer); state.shuffleTimer = null;
-            }
-          } catch (e) { }
+          // ★ 随机模式：**只在进入屏保时打乱一次**（applyOverride 里做）。
+          //   这里原本还有一个「放完一轮后再打乱一次」的定时器，已删除：
+          //   它只有两种结局，都被用户实测到了：
+          //     1) 用户早退出了屏保 -> 这一下凭空把屏保弹出来（301 秒那个 bug）
+          //     2) 用户还在看   -> 一轮播完时再塞消息，渲染器已处于播完状态，
+          //        不会正确重建，直接**黑屏**（用户最新反馈）
+          //   而它的收益只是「同一张不放两次」，完全可以用重新进入屏保实现。
+          //   删掉它是唯一能同时消灭黑屏和误弹屏保的办法。
+          if (state.shuffleTimer) { clearTimeout(state.shuffleTimer); state.shuffleTimer = null; }
           return __ret;
         }
       } catch (e) {
@@ -918,8 +888,12 @@
       var txt = String((r && r.stdout) || '') + String((r && r.stderr) || '');
       var mm = txt.match(/KILLED=([0-9]+)/);
       if (mm) {
-        log.info('按 profile 兜底：实际杀掉了 ' + mm[1] + ' 个浏览器进程');
-        return true;
+        var kn = Number(mm[1]);
+        log.info('按 profile 兜底：实际杀掉了 ' + kn + ' 个浏览器进程');
+        // 必须返回「有没有真的杀掉」，不能返回「脚本跑完没」。
+        // 原来恒为 true，导致后面的 exe 路径兜底永远轮不到执行 ——
+        // 日志里「实际杀掉了 0 个」之后就直接结束了，浏览器当然退不出。
+        return kn > 0;
       }
       log.warn('按 profile 兜底未确认结果: ' + txt.slice(0, 200));
       return false;
@@ -984,27 +958,31 @@
         state.webShortcut = null;
       }
       closeWebExitButton(log, state);
-      // 系统浏览器模式：杀掉我们拉起来的进程（含子进程）
+
+      var killed = false;
+
+      // 第一层：还有进程句柄时直接 kill + taskkill
       if (state && state.webProc) {
         log.info('正在关闭外部浏览器 pid=' + state.webProc.pid);
         try { state.webProc.kill(); } catch (e) { }
         try {
-          var cp2 = require('child_process');
-          cp2.spawn('taskkill.exe', ['/PID', String(state.webProc.pid), '/T', '/F'], { stdio: 'ignore' });
+          require('child_process').spawn('taskkill.exe',
+            ['/PID', String(state.webProc.pid), '/T', '/F'], { stdio: 'ignore' });
         } catch (e) { }
         state.webProc = null;
+        killed = true;
         log.info('已关闭系统浏览器（已发 kill + taskkill）');
-      } else {
-        // 兜底：进程句柄没了，但 PID 文件还在 -> 按 PID 杀
+      }
+
+      // 第二层：按 PID 文件
+      if (!killed && state) {
         try {
           var pf2 = resolveDataFile(['seewo', 'AuraScreensaver', 'web-browser.pid']);
           var fsv2 = require('fs');
           if (fsv2.existsSync(pf2)) {
             var pid2 = String(fsv2.readFileSync(pf2, 'utf8')).trim();
-            var killed = false;
             if (/^[0-9]+$/.test(pid2)) {
               log.warn('没有进程句柄，按 PID 文件兜底杀 pid=' + pid2);
-              // 同步执行并读回结果：异步 spawn 看不到成败，出了问题无从判断
               var rr2 = require('child_process').spawnSync('taskkill.exe', ['/PID', pid2, '/T', '/F'],
                 { encoding: 'utf8', timeout: 8000, windowsHide: true });
               var oo2 = String((rr2 && rr2.stdout) || '') + String((rr2 && rr2.stderr) || '');
@@ -1016,15 +994,31 @@
               }
             }
             try { fsv2.unlinkSync(pf2); } catch (e2) { }
-            if (!killed) { killed = killBrowserByProfile(state && state.webProfile, log); }
-            if (!killed) { killByExePath(state && state.webExe, log); }
-          } else {
-            if (!killBrowserByProfile(state && state.webProfile, log)) {
-              log.warn('关闭网页屏保：句柄 / PID / profile 三种方式都没能关闭外部浏览器');
-            }
           }
         } catch (e3) { }
       }
+
+      // ★ 兜底链必须**无条件**跑完整：profile / exe 路径 / 镜像名。
+      //   原来 exe 兜底被写在「PID 文件存在」分支里，PID 文件一没就永远不执行；
+      //   而 profile 层又恒返回 true 把 exe 层短路掉。两层 bug 叠加 = 永远关不掉。
+      if (!killed) { killed = killBrowserByProfile(state && state.webProfile, log); }
+      if (!killed) { killed = killByExePath(state && state.webExe, log); }
+      if (!killed && state && state.webExe) {
+        // 最后一层：按镜像名。kiosk 下浏览器可能以子进程形式存在，
+        // ExecutablePath 拿不到时上面那层会漏。
+        try {
+          var nm = require('path').basename(String(state.webExe)).toLowerCase();
+          var rs2 = require('child_process').spawnSync('taskkill.exe', ['/IM', nm, '/F'],
+            { encoding: 'utf8', timeout: 8000, windowsHide: true });
+          var ot2 = String((rs2 && rs2.stdout) || '') + String((rs2 && rs2.stderr) || '');
+          log.info('按镜像名兜底（' + nm + '）：' + ot2.trim().slice(0, 160));
+          killed = true;
+        } catch (e4) { log.warn('按镜像名兜底失败: ' + (e4 && e4.message || e4)); }
+      }
+      if (!killed) {
+        log.warn('关闭网页屏保：pid / profile / exe 路径 / 镜像名 四种方式都没能关闭外部浏览器');
+      }
+
       if (state && state.webWin) {
         try { if (!state.webWin.isDestroyed()) state.webWin.close(); } catch (e) { }
         state.webWin = null;

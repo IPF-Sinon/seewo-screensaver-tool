@@ -5,19 +5,37 @@ const { app, BrowserWindow, globalShortcut } = require('electron');
 const fs = require('fs');
 const pathMod = require('path');
 
-// 内核自己写日志，便于排查「打开一片空白」这类问题
-const LOG_FILE = (function () {
+// 管理员/SYSTEM 身份下 Chromium 沙箱起不来，渲染进程会被拒绝，
+// 表现就是「窗口在、但一片空白」。希沃管家本身是管理员服务，这条必须关。
+try { app.commandLine.appendSwitch('no-sandbox'); } catch (e) { }
+try { app.commandLine.appendSwitch('disable-gpu-sandbox'); } catch (e) { }
+
+// 内核自己写日志。同时写两个位置：exe 同级目录（一定存在且可写）+ LOCALAPPDATA。
+// 之前只写 LOCALAPPDATA，环境变量拿不到就完全没有日志，排查等于瞎猜。
+const LOG_TARGETS = (function () {
+  const out = [];
+  try { out.push(pathMod.join(pathMod.dirname(process.execPath), 'kernel.log')); } catch (e) { }
   try {
-    const base = process.env.LOCALAPPDATA || process.env.APPDATA || '.';
-    const d = pathMod.join(base, 'seewo', 'AuraScreensaver', 'logs');
-    fs.mkdirSync(d, { recursive: true });
-    return pathMod.join(d, 'kernel.log');
-  } catch (e) { return null; }
+    const base = process.env.LOCALAPPDATA || process.env.APPDATA || '';
+    if (base) {
+      const d = pathMod.join(base, 'seewo', 'AuraScreensaver', 'logs');
+      fs.mkdirSync(d, { recursive: true });
+      out.push(pathMod.join(d, 'kernel.log'));
+    }
+  } catch (e) { }
+  return out;
 })();
+
 function klog(msg) {
-  try { if (LOG_FILE) fs.appendFileSync(LOG_FILE, new Date().toISOString() + '  ' + msg + '\n'); } catch (e) { }
+  const line = new Date().toISOString() + '  ' + msg + '\n';
+  for (let i = 0; i < LOG_TARGETS.length; i++) {
+    try { fs.appendFileSync(LOG_TARGETS[i], line); } catch (e) { }
+  }
 }
-klog('=== kernel start, argv=' + JSON.stringify(process.argv.slice(1)));
+klog('=== kernel start, exe=' + process.execPath);
+klog('argv=' + JSON.stringify(process.argv.slice(1)));
+klog('resourcesPath=' + process.resourcesPath);
+try { klog('appPath=' + app.getAppPath() + ' isPackaged=' + String(app.isPackaged)); } catch (e) { }
 
 function argVal(name) {
   const p = '--' + name + '=';
@@ -30,6 +48,7 @@ const PID_FILE = argVal('aura-pid');
 
 let win = null;
 let quitting = false;
+let shown = false;
 
 function quit() {
   if (quitting) { return; }
@@ -54,6 +73,26 @@ function inject() {
       '}catch(e){}})()';
     win.webContents.executeJavaScript(js).catch(function () { });
   } catch (e) { }
+}
+
+// 出问题时不要留个纯白窗口 —— 把原因直接显示在屏幕上。
+function showProblem(title, detail) {
+  try {
+    const html = '<html><body style="margin:0;background:#111;color:#eee;font:15px/1.8 system-ui,sans-serif;' +
+      'display:flex;align-items:center;justify-content:center;height:100vh">' +
+      '<div style="max-width:760px;padding:28px">' +
+      '<div style="font-size:20px;font-weight:600;color:#ff8a80;margin-bottom:12px">' + title + '</div>' +
+      '<div style="white-space:pre-wrap;word-break:break-word;opacity:.85">' + detail + '</div>' +
+      '<div style="margin-top:18px;opacity:.6;font-size:13px">按 Esc 或 Ctrl+Alt+Q 退出屏保。详细日志见 kernel.log。</div>' +
+      '</div></body></html>';
+    win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+  } catch (e) { }
+}
+
+function ensureShown() {
+  if (shown) { return; }
+  shown = true;
+  try { win.show(); klog('window shown'); } catch (e) { klog('show 失败: ' + (e && e.message || e)); }
 }
 
 app.whenReady().then(function () {
@@ -92,23 +131,58 @@ app.whenReady().then(function () {
     });
   } catch (e) { }
   // 4) 每次加载完成都补一次按钮（页面内跳转会把它清掉）
-  wc.on('did-finish-load', inject);
   wc.on('did-navigate-in-page', inject);
 
-  win.once('ready-to-show', function () { try { win.show(); klog('window shown'); } catch (e) { } });
-  wc.on('did-finish-load', function () { klog('did-finish-load'); });
-  wc.on('did-fail-load', function (ev, code, desc, u) { klog('did-fail-load ' + code + ' ' + desc + ' ' + u); });
-  wc.on('render-process-gone', function (ev, d) { klog('render-process-gone ' + JSON.stringify(d)); });
+  wc.on('did-finish-load', function () {
+    inject();
+    klog('did-finish-load url=' + wc.getURL());
+    // 区分「根本没加载」和「加载了但页面是空的」—— 白屏排查的关键信息
+    wc.executeJavaScript('JSON.stringify({t:document.title,l:(document.body&&document.body.innerText||"").length,bg:getComputedStyle(document.body||document.documentElement).backgroundColor})')
+      .then(function (v) { klog('page state = ' + v); })
+      .catch(function (e) { klog('page state 读取失败: ' + (e && e.message || e)); });
+  });
+  wc.on('did-fail-load', function (ev, code, desc, u, isMain) {
+    klog('did-fail-load code=' + code + ' desc=' + desc + ' url=' + u + ' main=' + String(isMain));
+    if (isMain === false) { return; }
+    showProblem('网页加载失败 (' + code + ')', desc + '\n' + u);
+  });
+  wc.on('render-process-gone', function (ev, d) {
+    klog('render-process-gone ' + JSON.stringify(d));
+    showProblem('页面渲染进程异常退出', JSON.stringify(d));
+  });
   win.on('closed', function () { quit(); });
 
-  klog('target url = ' + URL_);
-  if (URL_) { win.loadURL(URL_).catch(function (e) { klog('loadURL 失败: ' + e.message); }); } else { klog('[!!] URL_ 为空，窗口会是空白'); }
+  // ready-to-show 在页面不绘制时永远不触发，窗口就一直隐藏，
+  // 用户看到的就是「什么都没发生」。加一个超时兜底。
+  win.once('ready-to-show', ensureShown);
+  setTimeout(ensureShown, 1500);
+
+  klog('target url = ' + (URL_ || '(空)'));
+  if (URL_) {
+    win.loadURL(URL_).catch(function (e) {
+      klog('loadURL 失败: ' + (e && e.message || e));
+      showProblem('无法打开网页', String((e && e.message) || e));
+    });
+  } else {
+    klog('[!!] URL_ 为空');
+    showProblem('没有收到要显示的网址', '启动参数里缺少 --aura-url=...');
+  }
 
   // 5) 全局快捷键兜底
   try { globalShortcut.register('CommandOrControl+Alt+Q', quit); } catch (e) { }
   try { globalShortcut.register('CommandOrControl+Shift+Q', quit); } catch (e) { }
 
   if (PID_FILE) { try { fs.writeFileSync(PID_FILE, String(process.pid), 'utf8'); } catch (e) { } }
+}).catch(function (e) {
+  klog('whenReady 失败: ' + (e && e.stack || e));
+  try { showProblem('内核启动失败', String((e && e.stack) || e)); } catch (e2) { }
 });
 
-process.on('uncaughtException', function () { quit(); });
+// 原来这里是 uncaughtException -> quit，任何小异常都直接退出，
+// 用户看到的就是「闪一下/白屏就没了」。改成只记日志、不退出。
+process.on('uncaughtException', function (e) {
+  klog('uncaughtException: ' + (e && e.stack || e));
+});
+process.on('unhandledRejection', function (e) {
+  klog('unhandledRejection: ' + (e && (e.stack || e.message) || e));
+});
