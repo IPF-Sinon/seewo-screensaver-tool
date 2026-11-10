@@ -5,6 +5,19 @@ const evt = T.event || null;
 const $ = (id) => document.getElementById(id);
 
 let STATE = null;
+
+// ★ 全局兜底：未捕获的异常 / Promise 拒绝都弹出来。
+//   之前 askDialog 不是全局函数，点击时抛 ReferenceError，
+//   被 async 函数静默吞掉，界面上表现为「点了毫无反应」，极难排查。
+window.addEventListener("error", function (ev) {
+  try { if (typeof alertBox === "function") alertBox("界面异常：" + (ev.message || ev.error)); } catch (e) { }
+});
+window.addEventListener("unhandledrejection", function (ev) {
+  try {
+    var r = ev.reason;
+    if (typeof alertBox === "function") alertBox("未处理的错误：" + ((r && r.message) || r));
+  } catch (e) { }
+});
 let LAST_MODE = 'none';     // 记住禁用前的实际模式，便于切回
 let toastTimer = null;
 
@@ -24,27 +37,78 @@ async function call(cmd, args) { return await invoke(cmd, args || {}); }
 async function tryCall(cmd, args) {
   try { return await call(cmd, args); }
   catch (e) { toast(typeof e === 'string' ? e : (e && e.message) || '操作失败', 'err'); return null; }
-// ★ 必须用 Tauri 原生对话框，不能用 window.confirm / window.alert：
-//   Tauri 的 WebView2 对脚本对话框不处理时会**直接当成确定**，
-//   于是「弹窗还没点确认，代码就已经走下去了」——
-//   用户反馈的「提权弹窗还没点确认就提权完成」就是这个原因。
+}
+
+// ---------------- 确认 / 提示对话框 ----------------
+// ★ 不用 window.confirm：Tauri 的 WebView2 对脚本对话框不处理时会直接当成「确定」。
+// ★ 也不用 Tauri 的 ask_dialog：它是 Rust 侧命令，同步调用会在主线程死锁，
+//   写成 async 也可能因为插件/线程问题卡住 —— 实测就是「点了毫无反应」。
+//   这里干脆用**前端自绘的模态框**，纯 DOM，没有任何 IPC 依赖，最可靠。
+function uiDialog(message, withCancel) {
+  return new Promise(function (resolve) {
+    // 防止重复弹窗叠加
+    var old = document.getElementById('__ui_dlg');
+    if (old) { try { old.remove(); } catch (e) { } }
+
+    var mask = document.createElement('div');
+    mask.id = '__ui_dlg';
+    mask.className = 'ui-dlg-mask';
+
+    var box = document.createElement('div');
+    box.className = 'ui-dlg';
+
+    var txt = document.createElement('div');
+    txt.className = 'ui-dlg-text';
+    txt.textContent = String(message);
+    box.appendChild(txt);
+
+    var row = document.createElement('div');
+    row.className = 'ui-dlg-row';
+
+    function done(v) {
+      try { mask.remove(); } catch (e) { }
+      document.removeEventListener('keydown', onKey);
+      resolve(v);
+    }
+
+    function onKey(ev) {
+      if (ev.key === 'Escape') { ev.preventDefault(); done(false); }
+      else if (ev.key === 'Enter') { ev.preventDefault(); done(true); }
+    }
+
+    if (withCancel) {
+      var c = document.createElement('button');
+      c.className = 'btn ghost';
+      c.textContent = '取消';
+      c.onclick = function () { done(false); };
+      row.appendChild(c);
+    }
+
+    var o = document.createElement('button');
+    o.className = 'btn primary';
+    o.textContent = '确定';
+    o.onclick = function () { done(true); };
+    row.appendChild(o);
+
+    box.appendChild(row);
+    mask.appendChild(box);
+    mask.addEventListener('click', function (ev) { if (ev.target === mask) done(false); });
+    document.body.appendChild(mask);
+    document.addEventListener('keydown', onKey);
+    try { o.focus(); } catch (e) { }
+  });
+}
+
 async function askDialog(message) {
-  // 拿不到明确结果时一律按「取消」处理（安全方向）：
-  // 宁可什么都不做，也绝不能悄悄替用户点头。
   try {
-    const r = await tryCall('ask_dialog', { title: '请确认', message: String(message) });
-    if (r === true) return true;
-    if (r === false) return false;
-    await alertBox('确认对话框返回了异常结果，已按「取消」处理。');
-    return false;
+    return await uiDialog(message, true);
   } catch (e) {
-    await alertBox('确认对话框调用失败，已按「取消」处理：' + (e && e.message || e));
-    return false;
+    return false;   // 出错一律按「取消」，绝不悄悄替用户点头
   }
 }
+
 async function alertBox(message) {
-  await tryCall('alert_dialog', { title: '提示', message: String(message) });
-}
+  try { await uiDialog(message, false); } catch (e) { }
 }
 // 统一封装：mode = single | multi | folder，kind = image | web | exe
 async function pickPaths(mode, kind) {
@@ -434,9 +498,15 @@ function bind() {
     if (r) toast('已请求停止预览', 'ok');
   });
 
-  $('btnPatch').addEventListener('click', function () { safeFlow('install'); });
-  $('btnUnpatch').addEventListener('click', async function () {
-    if (await askDialog('确定还原成官方版本吗？自定义屏保会失效（图片配置仍保留）。')) safeFlow('uninstall');
+  $('btnPatch').addEventListener('click', function () {
+    safeFlow('install').catch(function (e) {
+      alertBox('安装流程出错：' + ((e && e.message) || e));
+    });
+  });
+  $('btnUnpatch').addEventListener('click', function () {
+    (async function () {
+      if (await askDialog('确定还原成官方版本吗？自定义屏保会失效（图片配置仍保留）。')) await safeFlow('uninstall');
+    })().catch(function (e) { alertBox('卸载流程出错：' + ((e && e.message) || e)); });
   });
   $('btnDiag').addEventListener('click', async function () {
     const s = await tryCall('diagnostics');

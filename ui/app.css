@@ -120,3 +120,24 @@ input:disabled,textarea:disabled{opacity:.55;background:#f4f6fa}
 .li-note{font-size:11.5px;color:var(--dim);line-height:1.5;margin-top:1px}
 .list-item{align-items:flex-start}
 .list-item input{margin-top:2px}
+
+/* ---- 自绘确认/提示对话框 ---- */
+.ui-dlg-mask{
+  position:fixed;inset:0;z-index:99999;
+  background:rgba(0,0,0,.45);
+  display:flex;align-items:center;justify-content:center;
+  animation:dlgFade .12s ease-out;
+}
+@keyframes dlgFade{from{opacity:0}to{opacity:1}}
+.ui-dlg{
+  min-width:260px;max-width:420px;
+  background:var(--card,#fff);color:var(--fg,#111);
+  border-radius:10px;padding:16px 18px;
+  box-shadow:0 12px 40px rgba(0,0,0,.35);
+  border:1px solid var(--line,rgba(0,0,0,.08));
+}
+.ui-dlg-text{
+  font-size:13px;line-height:1.65;white-space:pre-wrap;
+  word-break:break-word;max-height:46vh;overflow:auto;
+}
+.ui-dlg-row{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
